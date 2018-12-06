@@ -62,7 +62,7 @@ The open source license grants you the freedom to use Node.js. It does not
 guarantee commitments of other people's time. Please be respectful and manage
 your expectations.
 
-## Release Types 
+## Release Types
 
 * **Current**: Under active development. Code for the Current release is in the
   branch for its major version number (for example,
@@ -83,7 +83,7 @@ your expectations.
 Current and LTS releases follow [Semantic Versioning](https://semver.org). A
 member of the Release Team [signs](#release-keys) each Current and LTS release.
 For more information, see the
-[Release README](https://github.com/nodejs/Release).
+[Release README](https://github.com/nodejs/Release#readme).
 
 ### Download
 
@@ -249,6 +249,8 @@ For information about the governance of the Node.js project, see
 **Andreas Madsen** &lt;amwebdk@gmail.com&gt; (he/him)
 * [AnnaMag](https://github.com/AnnaMag) -
 **Anna M. Kedzierska** &lt;anna.m.kedzierska@gmail.com&gt;
+* [antsmartian](https://github.com/antsmartian) -
+**Anto Aravinth** &lt;anto.aravinth.cse@gmail.com&gt; (he/him)
 * [apapirovski](https://github.com/apapirovski) -
 **Anatoli Papirovski** &lt;apapirovski@mac.com&gt; (he/him)
 * [aqrln](https://github.com/aqrln) -

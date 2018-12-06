@@ -2204,7 +2204,9 @@ request.
 
 ### crypto.randomFillSync(buffer[, offset][, size])
 <!-- YAML
-added: v7.10.0
+added:
+  - v7.10.0
+  - v6.13.0
 changes:
   - version: v9.0.0
     pr-url: https://github.com/nodejs/node/pull/15231
@@ -2248,7 +2250,9 @@ console.log(Buffer.from(crypto.randomFillSync(c).buffer,
 
 ### crypto.randomFill(buffer[, offset][, size], callback)
 <!-- YAML
-added: v7.10.0
+added:
+  - v7.10.0
+  - v6.13.0
 changes:
   - version: v9.0.0
     pr-url: https://github.com/nodejs/node/pull/15231
@@ -2947,14 +2951,14 @@ the `crypto`, `tls`, and `https` modules and are generally specific to OpenSSL.
 [`hmac.update()`]: #crypto_hmac_update_data_inputencoding
 [`sign.sign()`]: #crypto_sign_sign_privatekey_outputencoding
 [`sign.update()`]: #crypto_sign_update_data_inputencoding
-[`stream.transform` options]: stream.html#stream_new_stream_transform_options
 [`stream.Writable` options]: stream.html#stream_constructor_new_stream_writable_options
+[`stream.transform` options]: stream.html#stream_new_stream_transform_options
 [`util.promisify()`]: util.html#util_util_promisify_original
 [`verify.update()`]: #crypto_verify_update_data_inputencoding
 [`verify.verify()`]: #crypto_verify_verify_object_signature_signatureencoding
 [AEAD algorithms]: https://en.wikipedia.org/wiki/Authenticated_encryption
-[Caveats]: #crypto_support_for_weak_or_compromised_algorithms
 [CCM mode]: #crypto_ccm_mode
+[Caveats]: #crypto_support_for_weak_or_compromised_algorithms
 [Crypto Constants]: #crypto_crypto_constants_1
 [HTML 5.2]: https://www.w3.org/TR/html52/changes.html#features-removed
 [HTML5's `keygen` element]: https://developer.mozilla.org/en-US/docs/Web/HTML/Element/keygen

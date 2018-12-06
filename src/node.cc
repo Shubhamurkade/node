@@ -19,11 +19,13 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#include "node_binding.h"
 #include "node_buffer.h"
 #include "node_constants.h"
 #include "node_context_data.h"
 #include "node_errors.h"
 #include "node_internals.h"
+#include "node_metadata.h"
 #include "node_native_module.h"
 #include "node_perf.h"
 #include "node_platform.h"
@@ -47,16 +49,9 @@
 #include "node_dtrace.h"
 #endif
 
-#include "ares.h"
 #include "async_wrap-inl.h"
 #include "env-inl.h"
 #include "handle_wrap.h"
-#ifdef NODE_EXPERIMENTAL_HTTP
-# include "llhttp.h"
-#else  /* !NODE_EXPERIMENTAL_HTTP */
-# include "http_parser.h"
-#endif  /* NODE_EXPERIMENTAL_HTTP */
-#include "nghttp2/nghttp2ver.h"
 #include "req_wrap-inl.h"
 #include "string_bytes.h"
 #include "tracing/agent.h"
@@ -67,7 +62,6 @@
 #include "libplatform/libplatform.h"
 #endif  // NODE_USE_V8_PLATFORM
 #include "v8-profiler.h"
-#include "zlib.h"
 
 #ifdef NODE_ENABLE_VTUNE_PROFILING
 #include "../deps/v8/src/third_party/vtune/v8-vtune.h"
@@ -113,20 +107,6 @@ typedef int mode_t;
 #include <grp.h>  // getgrnam()
 #endif
 
-#if defined(__POSIX__)
-#include <dlfcn.h>
-#endif
-
-// This is used to load built-in modules. Instead of using
-// __attribute__((constructor)), we call the _register_<modname>
-// function for each built-in modules explicitly in
-// node::RegisterBuiltinModules(). This is only forward declaration.
-// The definitions are in each module's implementation when calling
-// the NODE_BUILTIN_MODULE_CONTEXT_AWARE.
-#define V(modname) void _register_##modname();
-  NODE_BUILTIN_MODULES(V)
-#undef V
-
 namespace node {
 
 using native_module::NativeModuleLoader;
@@ -136,7 +116,6 @@ using v8::Array;
 using v8::Boolean;
 using v8::Context;
 using v8::DEFAULT;
-using v8::DontEnum;
 using v8::EscapableHandleScope;
 using v8::Exception;
 using v8::Function;
@@ -156,47 +135,19 @@ using v8::NamedPropertyHandlerConfiguration;
 using v8::NewStringType;
 using v8::None;
 using v8::Nothing;
-using v8::Null;
 using v8::Object;
 using v8::ObjectTemplate;
-using v8::PropertyAttribute;
-using v8::ReadOnly;
 using v8::Script;
-using v8::ScriptCompiler;
 using v8::ScriptOrigin;
 using v8::SealHandleScope;
 using v8::SideEffectType;
 using v8::String;
 using v8::TracingController;
-using v8::TryCatch;
 using v8::Undefined;
 using v8::V8;
 using v8::Value;
 
 static bool v8_is_profiling = false;
-static bool node_is_initialized = false;
-static uv_once_t init_modpending_once = UV_ONCE_INIT;
-static uv_key_t thread_local_modpending;
-static node_module* modlist_builtin;
-static node_module* modlist_internal;
-static node_module* modlist_linked;
-static node_module* modlist_addon;
-
-#ifdef NODE_EXPERIMENTAL_HTTP
-static const char llhttp_version[] =
-    NODE_STRINGIFY(LLHTTP_VERSION_MAJOR)
-    "."
-    NODE_STRINGIFY(LLHTTP_VERSION_MINOR)
-    "."
-    NODE_STRINGIFY(LLHTTP_VERSION_PATCH);
-#else  /* !NODE_EXPERIMENTAL_HTTP */
-static const char http_parser_version[] =
-    NODE_STRINGIFY(HTTP_PARSER_VERSION_MAJOR)
-    "."
-    NODE_STRINGIFY(HTTP_PARSER_VERSION_MINOR)
-    "."
-    NODE_STRINGIFY(HTTP_PARSER_VERSION_PATCH);
-#endif  /* NODE_EXPERIMENTAL_HTTP */
 
 // Bit flag used to track security reverts (see node_revert.h)
 unsigned int reverted = 0;
@@ -236,27 +187,12 @@ class NodeTraceStateObserver :
     auto trace_process = tracing::TracedValue::Create();
     trace_process->BeginDictionary("versions");
 
-#ifdef NODE_EXPERIMENTAL_HTTP
-    trace_process->SetString("llhttp", llhttp_version);
-#else  /* !NODE_EXPERIMENTAL_HTTP */
-    trace_process->SetString("http_parser", http_parser_version);
-#endif  /* NODE_EXPERIMENTAL_HTTP */
+#define V(key)                                                                 \
+  trace_process->SetString(#key, per_process::metadata.versions.key.c_str());
 
-    const char node_napi_version[] = NODE_STRINGIFY(NAPI_VERSION);
-    const char node_modules_version[] = NODE_STRINGIFY(NODE_MODULE_VERSION);
+    NODE_VERSIONS_KEYS(V)
+#undef V
 
-    trace_process->SetString("node", NODE_VERSION_STRING);
-    trace_process->SetString("v8", V8::GetVersion());
-    trace_process->SetString("uv", uv_version_string());
-    trace_process->SetString("zlib", ZLIB_VERSION);
-    trace_process->SetString("ares", ARES_VERSION_STR);
-    trace_process->SetString("modules", node_modules_version);
-    trace_process->SetString("nghttp2", NGHTTP2_VERSION);
-    trace_process->SetString("napi", node_napi_version);
-
-#if HAVE_OPENSSL
-    trace_process->SetString("openssl", crypto::GetOpenSSLVersion());
-#endif
     trace_process->EndDictionary();
 
     trace_process->SetString("arch", NODE_ARCH);
@@ -762,41 +698,6 @@ Local<Value> MakeCallback(Isolate* isolate,
           .FromMaybe(Local<Value>()));
 }
 
-// Executes a str within the current v8 context.
-static MaybeLocal<Value> ExecuteString(Environment* env,
-                                       Local<String> source,
-                                       Local<String> filename) {
-  EscapableHandleScope scope(env->isolate());
-  TryCatch try_catch(env->isolate());
-
-  // try_catch must be nonverbose to disable FatalException() handler,
-  // we will handle exceptions ourself.
-  try_catch.SetVerbose(false);
-
-  ScriptOrigin origin(filename);
-
-  MaybeLocal<Script> script =
-      Script::Compile(env->context(), source, &origin);
-  if (script.IsEmpty()) {
-    ReportException(env, try_catch);
-    env->Exit(3);
-    return MaybeLocal<Value>();
-  }
-
-  MaybeLocal<Value> result = script.ToLocalChecked()->Run(env->context());
-  if (result.IsEmpty()) {
-    if (try_catch.HasTerminated()) {
-      env->isolate()->CancelTerminateExecution();
-      return MaybeLocal<Value>();
-    }
-    ReportException(env, try_catch);
-    env->Exit(4);
-    return MaybeLocal<Value>();
-  }
-
-  return scope.Escape(result.ToLocalChecked());
-}
-
 static void WaitForInspectorDisconnect(Environment* env) {
 #if HAVE_INSPECTOR
   if (env->inspector_agent()->IsActive()) {
@@ -824,257 +725,6 @@ static void Exit(const FunctionCallbackInfo<Value>& args) {
   v8_platform.StopTracingAgent();
   int code = args[0]->Int32Value(env->context()).FromMaybe(0);
   env->Exit(code);
-}
-
-extern "C" void node_module_register(void* m) {
-  struct node_module* mp = reinterpret_cast<struct node_module*>(m);
-
-  if (mp->nm_flags & NM_F_BUILTIN) {
-    mp->nm_link = modlist_builtin;
-    modlist_builtin = mp;
-  } else if (mp->nm_flags & NM_F_INTERNAL) {
-    mp->nm_link = modlist_internal;
-    modlist_internal = mp;
-  } else if (!node_is_initialized) {
-    // "Linked" modules are included as part of the node project.
-    // Like builtins they are registered *before* node::Init runs.
-    mp->nm_flags = NM_F_LINKED;
-    mp->nm_link = modlist_linked;
-    modlist_linked = mp;
-  } else {
-    uv_key_set(&thread_local_modpending, mp);
-  }
-}
-
-inline struct node_module* FindModule(struct node_module* list,
-                                      const char* name,
-                                      int flag) {
-  struct node_module* mp;
-
-  for (mp = list; mp != nullptr; mp = mp->nm_link) {
-    if (strcmp(mp->nm_modname, name) == 0)
-      break;
-  }
-
-  CHECK(mp == nullptr || (mp->nm_flags & flag) != 0);
-  return mp;
-}
-
-node_module* get_builtin_module(const char* name) {
-  return FindModule(modlist_builtin, name, NM_F_BUILTIN);
-}
-node_module* get_internal_module(const char* name) {
-  return FindModule(modlist_internal, name, NM_F_INTERNAL);
-}
-node_module* get_linked_module(const char* name) {
-  return FindModule(modlist_linked, name, NM_F_LINKED);
-}
-
-class DLib {
- public:
-#ifdef __POSIX__
-  static const int kDefaultFlags = RTLD_LAZY;
-#else
-  static const int kDefaultFlags = 0;
-#endif
-
-  inline DLib(const char* filename, int flags)
-      : filename_(filename), flags_(flags), handle_(nullptr) {}
-
-  inline bool Open();
-  inline void Close();
-  inline void* GetSymbolAddress(const char* name);
-
-  const std::string filename_;
-  const int flags_;
-  std::string errmsg_;
-  void* handle_;
-#ifndef __POSIX__
-  uv_lib_t lib_;
-#endif
- private:
-  DISALLOW_COPY_AND_ASSIGN(DLib);
-};
-
-
-#ifdef __POSIX__
-bool DLib::Open() {
-  handle_ = dlopen(filename_.c_str(), flags_);
-  if (handle_ != nullptr)
-    return true;
-  errmsg_ = dlerror();
-  return false;
-}
-
-void DLib::Close() {
-  if (handle_ == nullptr) return;
-  dlclose(handle_);
-  handle_ = nullptr;
-}
-
-void* DLib::GetSymbolAddress(const char* name) {
-  return dlsym(handle_, name);
-}
-#else  // !__POSIX__
-bool DLib::Open() {
-  int ret = uv_dlopen(filename_.c_str(), &lib_);
-  if (ret == 0) {
-    handle_ = static_cast<void*>(lib_.handle);
-    return true;
-  }
-  errmsg_ = uv_dlerror(&lib_);
-  uv_dlclose(&lib_);
-  return false;
-}
-
-void DLib::Close() {
-  if (handle_ == nullptr) return;
-  uv_dlclose(&lib_);
-  handle_ = nullptr;
-}
-
-void* DLib::GetSymbolAddress(const char* name) {
-  void* address;
-  if (0 == uv_dlsym(&lib_, name, &address)) return address;
-  return nullptr;
-}
-#endif  // !__POSIX__
-
-using InitializerCallback = void (*)(Local<Object> exports,
-                                     Local<Value> module,
-                                     Local<Context> context);
-
-inline InitializerCallback GetInitializerCallback(DLib* dlib) {
-  const char* name = "node_register_module_v" STRINGIFY(NODE_MODULE_VERSION);
-  return reinterpret_cast<InitializerCallback>(dlib->GetSymbolAddress(name));
-}
-
-inline napi_addon_register_func GetNapiInitializerCallback(DLib* dlib) {
-  const char* name =
-      STRINGIFY(NAPI_MODULE_INITIALIZER_BASE) STRINGIFY(NAPI_MODULE_VERSION);
-  return
-      reinterpret_cast<napi_addon_register_func>(dlib->GetSymbolAddress(name));
-}
-
-void InitModpendingOnce() {
-  CHECK_EQ(0, uv_key_create(&thread_local_modpending));
-}
-
-// DLOpen is process.dlopen(module, filename, flags).
-// Used to load 'module.node' dynamically shared objects.
-//
-// FIXME(bnoordhuis) Not multi-context ready. TBD how to resolve the conflict
-// when two contexts try to load the same shared object. Maybe have a shadow
-// cache that's a plain C list or hash table that's shared across contexts?
-static void DLOpen(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-  auto context = env->context();
-
-  uv_once(&init_modpending_once, InitModpendingOnce);
-  CHECK_NULL(uv_key_get(&thread_local_modpending));
-
-  if (args.Length() < 2) {
-    env->ThrowError("process.dlopen needs at least 2 arguments.");
-    return;
-  }
-
-  int32_t flags = DLib::kDefaultFlags;
-  if (args.Length() > 2 && !args[2]->Int32Value(context).To(&flags)) {
-    return env->ThrowTypeError("flag argument must be an integer.");
-  }
-
-  Local<Object> module;
-  Local<Object> exports;
-  Local<Value> exports_v;
-  if (!args[0]->ToObject(context).ToLocal(&module) ||
-      !module->Get(context, env->exports_string()).ToLocal(&exports_v) ||
-      !exports_v->ToObject(context).ToLocal(&exports)) {
-    return;  // Exception pending.
-  }
-
-  node::Utf8Value filename(env->isolate(), args[1]);  // Cast
-  DLib dlib(*filename, flags);
-  bool is_opened = dlib.Open();
-
-  // Objects containing v14 or later modules will have registered themselves
-  // on the pending list.  Activate all of them now.  At present, only one
-  // module per object is supported.
-  node_module* const mp = static_cast<node_module*>(
-      uv_key_get(&thread_local_modpending));
-  uv_key_set(&thread_local_modpending, nullptr);
-
-  if (!is_opened) {
-    Local<String> errmsg = OneByteString(env->isolate(), dlib.errmsg_.c_str());
-    dlib.Close();
-#ifdef _WIN32
-    // Windows needs to add the filename into the error message
-    errmsg = String::Concat(
-        env->isolate(), errmsg, args[1]->ToString(context).ToLocalChecked());
-#endif  // _WIN32
-    env->isolate()->ThrowException(Exception::Error(errmsg));
-    return;
-  }
-
-  if (mp == nullptr) {
-    if (auto callback = GetInitializerCallback(&dlib)) {
-      callback(exports, module, context);
-    } else if (auto napi_callback = GetNapiInitializerCallback(&dlib)) {
-      napi_module_register_by_symbol(exports, module, context, napi_callback);
-    } else {
-      dlib.Close();
-      env->ThrowError("Module did not self-register.");
-    }
-    return;
-  }
-
-  // -1 is used for N-API modules
-  if ((mp->nm_version != -1) && (mp->nm_version != NODE_MODULE_VERSION)) {
-    // Even if the module did self-register, it may have done so with the wrong
-    // version. We must only give up after having checked to see if it has an
-    // appropriate initializer callback.
-    if (auto callback = GetInitializerCallback(&dlib)) {
-      callback(exports, module, context);
-      return;
-    }
-    char errmsg[1024];
-    snprintf(errmsg,
-             sizeof(errmsg),
-             "The module '%s'"
-             "\nwas compiled against a different Node.js version using"
-             "\nNODE_MODULE_VERSION %d. This version of Node.js requires"
-             "\nNODE_MODULE_VERSION %d. Please try re-compiling or "
-             "re-installing\nthe module (for instance, using `npm rebuild` "
-             "or `npm install`).",
-             *filename, mp->nm_version, NODE_MODULE_VERSION);
-
-    // NOTE: `mp` is allocated inside of the shared library's memory, calling
-    // `dlclose` will deallocate it
-    dlib.Close();
-    env->ThrowError(errmsg);
-    return;
-  }
-  if (mp->nm_flags & NM_F_BUILTIN) {
-    dlib.Close();
-    env->ThrowError("Built-in module self-registered.");
-    return;
-  }
-
-  mp->nm_dso_handle = dlib.handle_;
-  mp->nm_link = modlist_addon;
-  modlist_addon = mp;
-
-  if (mp->nm_context_register_func != nullptr) {
-    mp->nm_context_register_func(exports, module, context, mp->nm_priv);
-  } else if (mp->nm_register_func != nullptr) {
-    mp->nm_register_func(exports, module, mp->nm_priv);
-  } else {
-    dlib.Close();
-    env->ThrowError("Module has no declared entry point.");
-    return;
-  }
-
-  // Tell coverity that 'handle' should not be freed when we return.
-  // coverity[leaked_storage]
 }
 
 static Maybe<bool> ProcessEmitWarningGeneric(Environment* env,
@@ -1180,118 +830,6 @@ static void OnMessage(Local<Message> message, Local<Value> error) {
   }
 }
 
-
-static Local<Object> InitModule(Environment* env,
-                                 node_module* mod,
-                                 Local<String> module) {
-  Local<Object> exports = Object::New(env->isolate());
-  // Internal bindings don't have a "module" object, only exports.
-  CHECK_NULL(mod->nm_register_func);
-  CHECK_NOT_NULL(mod->nm_context_register_func);
-  Local<Value> unused = Undefined(env->isolate());
-  mod->nm_context_register_func(exports,
-                                unused,
-                                env->context(),
-                                mod->nm_priv);
-  return exports;
-}
-
-static void ThrowIfNoSuchModule(Environment* env, const char* module_v) {
-  char errmsg[1024];
-  snprintf(errmsg,
-           sizeof(errmsg),
-           "No such module: %s",
-           module_v);
-  env->ThrowError(errmsg);
-}
-
-static void GetBinding(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-
-  CHECK(args[0]->IsString());
-
-  Local<String> module = args[0].As<String>();
-  node::Utf8Value module_v(env->isolate(), module);
-
-  node_module* mod = get_builtin_module(*module_v);
-  Local<Object> exports;
-  if (mod != nullptr) {
-    exports = InitModule(env, mod, module);
-  } else {
-    return ThrowIfNoSuchModule(env, *module_v);
-  }
-
-  args.GetReturnValue().Set(exports);
-}
-
-static void GetInternalBinding(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-
-  CHECK(args[0]->IsString());
-
-  Local<String> module = args[0].As<String>();
-  node::Utf8Value module_v(env->isolate(), module);
-  Local<Object> exports;
-
-  node_module* mod = get_internal_module(*module_v);
-  if (mod != nullptr) {
-    exports = InitModule(env, mod, module);
-  } else if (!strcmp(*module_v, "constants")) {
-    exports = Object::New(env->isolate());
-    CHECK(exports->SetPrototype(env->context(),
-                                Null(env->isolate())).FromJust());
-    DefineConstants(env->isolate(), exports);
-  } else if (!strcmp(*module_v, "natives")) {
-    exports = per_process_loader.GetSourceObject(env->context());
-  } else {
-    return ThrowIfNoSuchModule(env, *module_v);
-  }
-
-  args.GetReturnValue().Set(exports);
-}
-
-static void GetLinkedBinding(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-
-  CHECK(args[0]->IsString());
-
-  Local<String> module_name = args[0].As<String>();
-
-  node::Utf8Value module_name_v(env->isolate(), module_name);
-  node_module* mod = get_linked_module(*module_name_v);
-
-  if (mod == nullptr) {
-    char errmsg[1024];
-    snprintf(errmsg,
-             sizeof(errmsg),
-             "No such module was linked: %s",
-             *module_name_v);
-    return env->ThrowError(errmsg);
-  }
-
-  Local<Object> module = Object::New(env->isolate());
-  Local<Object> exports = Object::New(env->isolate());
-  Local<String> exports_prop = String::NewFromUtf8(env->isolate(), "exports",
-      NewStringType::kNormal).ToLocalChecked();
-  module->Set(env->context(), exports_prop, exports).FromJust();
-
-  if (mod->nm_context_register_func != nullptr) {
-    mod->nm_context_register_func(exports,
-                                  module,
-                                  env->context(),
-                                  mod->nm_priv);
-  } else if (mod->nm_register_func != nullptr) {
-    mod->nm_register_func(exports, module, mod->nm_priv);
-  } else {
-    return env->ThrowError("Linked module has no declared entry point.");
-  }
-
-  auto effective_exports = module->Get(env->context(),
-                                       exports_prop).ToLocalChecked();
-
-  args.GetReturnValue().Set(effective_exports);
-}
-
 static Local<Object> GetFeatures(Environment* env) {
   EscapableHandleScope scope(env->isolate());
 
@@ -1338,31 +876,12 @@ static Local<Object> GetFeatures(Environment* env) {
 static void DebugProcess(const FunctionCallbackInfo<Value>& args);
 static void DebugEnd(const FunctionCallbackInfo<Value>& args);
 
-namespace {
-
-#define READONLY_PROPERTY(obj, str, var)                                      \
-  do {                                                                        \
-    obj->DefineOwnProperty(env->context(),                                    \
-                           OneByteString(env->isolate(), str),                \
-                           var,                                               \
-                           ReadOnly).FromJust();                              \
-  } while (0)
-
-#define READONLY_DONT_ENUM_PROPERTY(obj, str, var)                            \
-  do {                                                                        \
-    obj->DefineOwnProperty(env->context(),                                    \
-                           OneByteString(env->isolate(), str),                \
-                           var,                                               \
-                           static_cast<PropertyAttribute>(ReadOnly|DontEnum)) \
-        .FromJust();                                                          \
-  } while (0)
-
-}  // anonymous namespace
-
 void SetupProcessObject(Environment* env,
                         const std::vector<std::string>& args,
                         const std::vector<std::string>& exec_args) {
-  HandleScope scope(env->isolate());
+  Isolate* isolate = env->isolate();
+  HandleScope scope(isolate);
+  Local<Context> context = env->context();
 
   Local<Object> process = env->process_object();
 
@@ -1386,53 +905,10 @@ void SetupProcessObject(Environment* env,
   Local<Object> versions = Object::New(env->isolate());
   READONLY_PROPERTY(process, "versions", versions);
 
-#ifdef NODE_EXPERIMENTAL_HTTP
-  READONLY_PROPERTY(versions,
-                    "llhttp",
-                    FIXED_ONE_BYTE_STRING(env->isolate(), llhttp_version));
-#else  /* !NODE_EXPERIMENTAL_HTTP */
-  READONLY_PROPERTY(versions,
-                    "http_parser",
-                    FIXED_ONE_BYTE_STRING(env->isolate(), http_parser_version));
-#endif  /* NODE_EXPERIMENTAL_HTTP */
-
-  // +1 to get rid of the leading 'v'
-  READONLY_PROPERTY(versions,
-                    "node",
-                    OneByteString(env->isolate(), NODE_VERSION + 1));
-  READONLY_PROPERTY(versions,
-                    "v8",
-                    OneByteString(env->isolate(), V8::GetVersion()));
-  READONLY_PROPERTY(versions,
-                    "uv",
-                    OneByteString(env->isolate(), uv_version_string()));
-  READONLY_PROPERTY(versions,
-                    "zlib",
-                    FIXED_ONE_BYTE_STRING(env->isolate(), ZLIB_VERSION));
-  READONLY_PROPERTY(versions,
-                    "ares",
-                    FIXED_ONE_BYTE_STRING(env->isolate(), ARES_VERSION_STR));
-
-  const char node_modules_version[] = NODE_STRINGIFY(NODE_MODULE_VERSION);
-  READONLY_PROPERTY(
-      versions,
-      "modules",
-      FIXED_ONE_BYTE_STRING(env->isolate(), node_modules_version));
-  READONLY_PROPERTY(versions,
-                    "nghttp2",
-                    FIXED_ONE_BYTE_STRING(env->isolate(), NGHTTP2_VERSION));
-  const char node_napi_version[] = NODE_STRINGIFY(NAPI_VERSION);
-  READONLY_PROPERTY(
-      versions,
-      "napi",
-      FIXED_ONE_BYTE_STRING(env->isolate(), node_napi_version));
-
-#if HAVE_OPENSSL
-  READONLY_PROPERTY(
-      versions,
-      "openssl",
-      OneByteString(env->isolate(), crypto::GetOpenSSLVersion().c_str()));
-#endif
+#define V(key)                                                                 \
+  READONLY_STRING_PROPERTY(versions, #key, per_process::metadata.versions.key);
+  NODE_VERSIONS_KEYS(V)
+#undef V
 
   // process.arch
   READONLY_PROPERTY(process, "arch", OneByteString(env->isolate(), NODE_ARCH));
@@ -1689,7 +1165,7 @@ void SetupProcessObject(Environment* env,
   env->SetMethod(process, "_kill", Kill);
 
   env->SetMethodNoSideEffect(process, "cwd", Cwd);
-  env->SetMethod(process, "dlopen", DLOpen);
+  env->SetMethod(process, "dlopen", binding::DLOpen);
   env->SetMethod(process, "reallyExit", Exit);
   env->SetMethodNoSideEffect(process, "uptime", Uptime);
 
@@ -1701,9 +1177,6 @@ void SetupProcessObject(Environment* env,
   env->SetMethodNoSideEffect(process, "getgroups", GetGroups);
 #endif  // __POSIX__ && !defined(__ANDROID__) && !defined(__CloudABI__)
 }
-
-
-#undef READONLY_PROPERTY
 
 
 void SignalExit(int signo) {
@@ -1718,39 +1191,13 @@ void SignalExit(int signo) {
   raise(signo);
 }
 
-
-static MaybeLocal<Function> GetBootstrapper(
+static MaybeLocal<Value> ExecuteBootstrapper(
     Environment* env,
-    Local<String> source,
-    Local<String> script_name) {
-  EscapableHandleScope scope(env->isolate());
-
-  TryCatch try_catch(env->isolate());
-
-  // Disable verbose mode to stop FatalException() handler from trying
-  // to handle the exception. Errors this early in the start-up phase
-  // are not safe to ignore.
-  try_catch.SetVerbose(false);
-
-  // Execute the bootstrapper javascript file
-  MaybeLocal<Value> bootstrapper_v = ExecuteString(env, source, script_name);
-  if (bootstrapper_v.IsEmpty())  // This happens when execution was interrupted.
-    return MaybeLocal<Function>();
-
-  if (try_catch.HasCaught())  {
-    ReportException(env, try_catch);
-    exit(10);
-  }
-
-  CHECK(bootstrapper_v.ToLocalChecked()->IsFunction());
-  return scope.Escape(bootstrapper_v.ToLocalChecked().As<Function>());
-}
-
-static bool ExecuteBootstrapper(Environment* env, Local<Function> bootstrapper,
-                                int argc, Local<Value> argv[],
-                                Local<Value>* out) {
-  bool ret = bootstrapper->Call(
-      env->context(), Null(env->isolate()), argc, argv).ToLocal(out);
+    const char* id,
+    std::vector<Local<String>>* parameters,
+    std::vector<Local<Value>>* arguments) {
+  MaybeLocal<Value> ret = per_process_loader.CompileAndCall(
+      env->context(), id, parameters, arguments, env);
 
   // If there was an error during bootstrap then it was either handled by the
   // FatalException handler or it's unrecoverable (e.g. max call stack
@@ -1759,121 +1206,86 @@ static bool ExecuteBootstrapper(Environment* env, Local<Function> bootstrapper,
   // There are only two ways to have a stack size > 1: 1) the user manually
   // called MakeCallback or 2) user awaited during bootstrap, which triggered
   // _tickCallback().
-  if (!ret) {
+  if (ret.IsEmpty()) {
     env->async_hooks()->clear_async_id_stack();
   }
 
   return ret;
 }
 
-
 void LoadEnvironment(Environment* env) {
   HandleScope handle_scope(env->isolate());
-
-  TryCatch try_catch(env->isolate());
-  // Disable verbose mode to stop FatalException() handler from trying
-  // to handle the exception. Errors this early in the start-up phase
-  // are not safe to ignore.
-  try_catch.SetVerbose(false);
-
-  // The bootstrapper scripts are lib/internal/bootstrap/loaders.js and
-  // lib/internal/bootstrap/node.js, each included as a static C string
-  // generated in node_javascript.cc by node_js2c.
-
-  // TODO(joyeecheung): use NativeModuleLoader::Compile
-  // We duplicate the string literals here since once we refactor the bootstrap
-  // compilation out to NativeModuleLoader none of this is going to matter
   Isolate* isolate = env->isolate();
-  Local<String> loaders_name =
-      FIXED_ONE_BYTE_STRING(isolate, "internal/bootstrap/loaders.js");
-  Local<String> loaders_source =
-      per_process_loader.GetSource(isolate, "internal/bootstrap/loaders");
-  MaybeLocal<Function> loaders_bootstrapper =
-      GetBootstrapper(env, loaders_source, loaders_name);
-  Local<String> node_name =
-      FIXED_ONE_BYTE_STRING(isolate, "internal/bootstrap/node.js");
-  Local<String> node_source =
-      per_process_loader.GetSource(isolate, "internal/bootstrap/node");
-  MaybeLocal<Function> node_bootstrapper =
-      GetBootstrapper(env, node_source, node_name);
-
-  if (loaders_bootstrapper.IsEmpty() || node_bootstrapper.IsEmpty()) {
-    // Execution was interrupted.
-    return;
-  }
+  Local<Context> context = env->context();
 
   // Add a reference to the global object
-  Local<Object> global = env->context()->Global();
+  Local<Object> global = context->Global();
 
 #if defined HAVE_DTRACE || defined HAVE_ETW
   InitDTrace(env, global);
 #endif
 
-  // Enable handling of uncaught exceptions
-  // (FatalException(), break on uncaught exception in debugger)
-  //
-  // This is not strictly necessary since it's almost impossible
-  // to attach the debugger fast enough to break on exception
-  // thrown during process startup.
-  try_catch.SetVerbose(true);
+  Local<Object> process = env->process_object();
 
-  env->SetMethod(env->process_object(), "_rawDebug", RawDebug);
-
+  // Setting global properties for the bootstrappers to use:
+  // - global
+  // - process._rawDebug
   // Expose the global object as a property on itself
   // (Allows you to set stuff on `global` from anywhere in JavaScript.)
-  global->Set(env->context(),
-              FIXED_ONE_BYTE_STRING(env->isolate(), "global"),
-              global).FromJust();
+  global->Set(context, FIXED_ONE_BYTE_STRING(env->isolate(), "global"), global)
+      .FromJust();
+  env->SetMethod(process, "_rawDebug", RawDebug);
 
   // Create binding loaders
-  Local<Function> get_binding_fn =
-      env->NewFunctionTemplate(GetBinding)->GetFunction(env->context())
-          .ToLocalChecked();
+  std::vector<Local<String>> loaders_params = {
+      env->process_string(),
+      FIXED_ONE_BYTE_STRING(isolate, "getBinding"),
+      FIXED_ONE_BYTE_STRING(isolate, "getLinkedBinding"),
+      FIXED_ONE_BYTE_STRING(isolate, "getInternalBinding"),
+      FIXED_ONE_BYTE_STRING(isolate, "debugBreak")};
+  std::vector<Local<Value>> loaders_args = {
+      process,
+      env->NewFunctionTemplate(binding::GetBinding)
+          ->GetFunction(context)
+          .ToLocalChecked(),
+      env->NewFunctionTemplate(binding::GetLinkedBinding)
+          ->GetFunction(context)
+          .ToLocalChecked(),
+      env->NewFunctionTemplate(binding::GetInternalBinding)
+          ->GetFunction(context)
+          .ToLocalChecked(),
+      Boolean::New(isolate,
+                   env->options()->debug_options->break_node_first_line)};
 
-  Local<Function> get_linked_binding_fn =
-      env->NewFunctionTemplate(GetLinkedBinding)->GetFunction(env->context())
-          .ToLocalChecked();
-
-  Local<Function> get_internal_binding_fn =
-      env->NewFunctionTemplate(GetInternalBinding)->GetFunction(env->context())
-          .ToLocalChecked();
-
-  Local<Value> loaders_bootstrapper_args[] = {
-    env->process_object(),
-    get_binding_fn,
-    get_linked_binding_fn,
-    get_internal_binding_fn,
-    Boolean::New(env->isolate(),
-                 env->options()->debug_options->break_node_first_line)
-  };
-
+  MaybeLocal<Value> loader_exports;
   // Bootstrap internal loaders
-  Local<Value> bootstrapped_loaders;
-  if (!ExecuteBootstrapper(env, loaders_bootstrapper.ToLocalChecked(),
-                           arraysize(loaders_bootstrapper_args),
-                           loaders_bootstrapper_args,
-                           &bootstrapped_loaders)) {
+  loader_exports = ExecuteBootstrapper(
+      env, "internal/bootstrap/loaders", &loaders_params, &loaders_args);
+  if (loader_exports.IsEmpty()) {
     return;
   }
-
-  Local<Function> trigger_fatal_exception =
-      env->NewFunctionTemplate(FatalException)->GetFunction(env->context())
-          .ToLocalChecked();
 
   // Bootstrap Node.js
   Local<Object> bootstrapper = Object::New(env->isolate());
   SetupBootstrapObject(env, bootstrapper);
-  Local<Value> bootstrapped_node;
-  Local<Value> node_bootstrapper_args[] = {
-    env->process_object(),
-    bootstrapper,
-    bootstrapped_loaders,
-    trigger_fatal_exception,
-  };
-  if (!ExecuteBootstrapper(env, node_bootstrapper.ToLocalChecked(),
-                           arraysize(node_bootstrapper_args),
-                           node_bootstrapper_args,
-                           &bootstrapped_node)) {
+
+  // process, bootstrappers, loaderExports, triggerFatalException
+  std::vector<Local<String>> node_params = {
+      env->process_string(),
+      FIXED_ONE_BYTE_STRING(isolate, "bootstrappers"),
+      FIXED_ONE_BYTE_STRING(isolate, "loaderExports"),
+      FIXED_ONE_BYTE_STRING(isolate, "triggerFatalException")};
+  std::vector<Local<Value>> node_args = {
+      process,
+      bootstrapper,
+      loader_exports.ToLocalChecked(),
+      env->NewFunctionTemplate(FatalException)
+          ->GetFunction(context)
+          .ToLocalChecked()};
+
+  if (ExecuteBootstrapper(
+          env, "internal/bootstrap/node", &node_params, &node_args)
+          .IsEmpty()) {
     return;
   }
 }
@@ -2207,7 +1619,7 @@ void Init(std::vector<std::string>* argv,
   prog_start_time = static_cast<double>(uv_now(uv_default_loop()));
 
   // Register built-in modules
-  RegisterBuiltinModules();
+  binding::RegisterBuiltinModules();
 
   // Make inherited handles noninheritable.
   uv_disable_stdio_inheritance();
@@ -2500,14 +1912,16 @@ Local<Context> NewContext(Isolate* isolate,
     // Run lib/internal/per_context.js
     Context::Scope context_scope(context);
 
-    // TODO(joyeecheung): use NativeModuleLoader::Compile
-    Local<String> per_context =
-        per_process_loader.GetSource(isolate, "internal/per_context");
-    ScriptCompiler::Source per_context_src(per_context, nullptr);
-    Local<Script> s = ScriptCompiler::Compile(
-        context,
-        &per_context_src).ToLocalChecked();
-    s->Run(context).ToLocalChecked();
+    std::vector<Local<String>> parameters = {
+        FIXED_ONE_BYTE_STRING(isolate, "global")};
+    std::vector<Local<Value>> arguments = {context->Global()};
+    MaybeLocal<Value> result = per_process_loader.CompileAndCall(
+        context, "internal/per_context", &parameters, &arguments, nullptr);
+    if (result.IsEmpty()) {
+      // Execution failed during context creation.
+      // TODO(joyeecheung): deprecate this signature and return a MaybeLocal.
+      return Local<Context>();
+    }
   }
 
   return context;
@@ -2724,14 +2138,6 @@ int Start(int argc, char** argv) {
   v8_platform.Dispose();
 
   return exit_code;
-}
-
-// Call built-in modules' _register_<module name> function to
-// do module registration explicitly.
-void RegisterBuiltinModules() {
-#define V(modname) _register_##modname();
-  NODE_BUILTIN_MODULES(V)
-#undef V
 }
 
 }  // namespace node

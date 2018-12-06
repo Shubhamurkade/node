@@ -1655,6 +1655,12 @@ recommended to use 2048 bits or larger for stronger security.
 A TLS/SSL handshake timed out. In this case, the server must also abort the
 connection.
 
+<a id="ERR_TLS_INVALID_PROTOCOL_METHOD"></a>
+### ERR_TLS_INVALID_PROTOCOL_METHOD
+
+The specified  `secureProtocol` method is invalid. It is  either unknown, or
+disabled because it is insecure.
+
 <a id="ERR_TLS_INVALID_PROTOCOL_VERSION"></a>
 ### ERR_TLS_INVALID_PROTOCOL_VERSION
 
@@ -1789,20 +1795,6 @@ An attempt was made to load a module with an unknown or unsupported format.
 An invalid or unknown process signal was passed to an API expecting a valid
 signal (such as [`subprocess.kill()`][]).
 
-<a id="ERR_UNKNOWN_STDIN_TYPE"></a>
-### ERR_UNKNOWN_STDIN_TYPE
-
-An attempt was made to launch a Node.js process with an unknown `stdin` file
-type. This error is usually an indication of a bug within Node.js itself,
-although it is possible for user code to trigger it.
-
-<a id="ERR_UNKNOWN_STREAM_TYPE"></a>
-### ERR_UNKNOWN_STREAM_TYPE
-
-An attempt was made to launch a Node.js process with an unknown `stdout` or
-`stderr` file type. This error is usually an indication of a bug within Node.js
-itself, although it is possible for user code to trigger it.
-
 <a id="ERR_V8BREAKITERATOR"></a>
 ### ERR_V8BREAKITERATOR
 
@@ -1880,9 +1872,15 @@ Creation of a [`zlib`][] object failed due to incorrect configuration.
 
 <a id="HPE_HEADER_OVERFLOW"></a>
 ### HPE_HEADER_OVERFLOW
+<!-- YAML
+changes:
+  - version: REPLACEME
+    pr-url: https://github.com/nodejs/node/commit/186035243fad247e3955f
+    description: Max header size in `http_parser` was set to 8KB.
+-->
 
 Too much HTTP header data was received. In order to protect against malicious or
-malconfigured clients, if more than 80KB of HTTP header data is received then
+malconfigured clients, if more than 8KB of HTTP header data is received then
 HTTP parsing will abort without a request or response object being created, and
 an `Error` with this code will be emitted.
 
@@ -2052,6 +2050,28 @@ The `'ERR_UNKNOWN_BUILTIN_MODULE'` error code is used to identify a specific
 kind of internal Node.js error that should not typically be triggered by user
 code. Instances of this error point to an internal bug within the Node.js
 binary itself.
+
+<a id="ERR_UNKNOWN_STDIN_TYPE"></a>
+### ERR_UNKNOWN_STDIN_TYPE
+<!-- YAML
+added: v8.0.0
+removed: REPLACEME
+-->
+
+An attempt was made to launch a Node.js process with an unknown `stdin` file
+type. This error is usually an indication of a bug within Node.js itself,
+although it is possible for user code to trigger it.
+
+<a id="ERR_UNKNOWN_STREAM_TYPE"></a>
+### ERR_UNKNOWN_STREAM_TYPE
+<!-- YAML
+added: v8.0.0
+removed: REPLACEME
+-->
+
+An attempt was made to launch a Node.js process with an unknown `stdout` or
+`stderr` file type. This error is usually an indication of a bug within Node.js
+itself, although it is possible for user code to trigger it.
 
 <a id="ERR_VALUE_OUT_OF_RANGE"></a>
 ### ERR_VALUE_OUT_OF_RANGE
